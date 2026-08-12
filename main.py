@@ -2,9 +2,13 @@ import json
 import os
 import platform
 import re
+import resource
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -140,7 +144,7 @@ GO_VERSION_RE = re.compile(rb"go1\.\d+(?:\.\d+){0,2}(?:rc\d+)?")
 GO_MODULE_RE = re.compile(rb"[a-zA-Z0-9._/-]+@v\d+\.\d+\.\d+[a-zA-Z0-9._+-]*")
 
 
-def scan_go_buildinfo(path: str, max_bytes: int = 32 * 1024 * 1024) -> dict[str, Any]:
+def scan_go_buildinfo(path: str, max_bytes: int = 4 * 1024 * 1024) -> dict[str, Any]:
     """Fingerprint a binary as Go-built without `go version`/`readelf`/`nm` -
     none of which exist in this image. Go embeds a "Go buildinf:" magic
     header (used internally by `go version <binary>`) plus literal
@@ -215,6 +219,143 @@ def go_binary_scan() -> dict[str, Any]:
             "/cnb/buildpacks", name_pattern=r"^(detect|build|main)$", max_entries=60
         ),
     }
+
+
+def survey_binaries(
+    directories: tuple[str, ...],
+    *,
+    max_entries: int = 150,
+) -> list[dict[str, Any]]:
+    """Broad sweep of every executable in the given directories (deduped by
+    realpath, since /bin, /sbin etc. are symlinks into /usr/*), each
+    fingerprinted with `file` and the Go buildinfo scanner. This is the
+    general "what's actually installed and shellable" inventory - not just
+    the Go-specific angle."""
+    seen_realpaths: set[str] = set()
+    results: list[dict[str, Any]] = []
+    for directory in directories:
+        if len(results) >= max_entries:
+            break
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            continue
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if len(results) >= max_entries:
+                break
+            try:
+                if not entry.is_file() or not os.access(entry, os.X_OK):
+                    continue
+                real = os.path.realpath(entry)
+            except OSError:
+                continue
+            if real in seen_realpaths:
+                continue
+            seen_realpaths.add(real)
+            results.append(
+                {
+                    "path": str(entry),
+                    "realpath": real,
+                    "file": run_command(["file", "-L", str(entry)]),
+                    "go_buildinfo": scan_go_buildinfo(real),
+                }
+            )
+    return results
+
+
+def entrypoint_binaries_info() -> dict[str, Any]:
+    """filesystem.root shows /start -> /usr/bin/pid1 and /serve ->
+    /usr/bin/serve - those, not /cnb/lifecycle/launcher, are what actually
+    boots and serves this function. Fingerprint them directly since the
+    generic binary_survey directory list may not include /usr/bin's full
+    contents if max_entries is hit first."""
+    result: dict[str, Any] = {}
+    for name, path in (("pid1", "/usr/bin/pid1"), ("serve", "/usr/bin/serve")):
+        entry: dict[str, Any] = {"path": path, "exists": os.path.exists(path)}
+        if entry["exists"]:
+            entry["file"] = run_command(["file", "-L", path])
+            entry["go_buildinfo"] = scan_go_buildinfo(path)
+        result[name] = entry
+    return result
+
+
+def installed_python_packages() -> list[dict[str, str]]:
+    """What's actually importable right now - the real answer to "what can
+    this Python environment do", as opposed to inferring it from shelling
+    out to OS-level tools."""
+    packages: dict[str, str] = {}
+    for dist in importlib_metadata.distributions():
+        name = dist.metadata.get("Name")
+        if not name:
+            continue
+        packages[name] = dist.version
+    return [
+        {"name": name, "version": version}
+        for name, version in sorted(packages.items(), key=lambda kv: kv[0].lower())
+    ]
+
+
+def resource_info() -> dict[str, Any]:
+    result: dict[str, Any] = {"cpu_count": os.cpu_count()}
+
+    for label, path in (("tmp", "/tmp"), ("workspace", "/workspace")):
+        try:
+            usage = shutil.disk_usage(path)
+            result[f"disk_usage_{label}"] = {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+            }
+        except OSError as exc:
+            result[f"disk_usage_{label}"] = {"error": repr(exc)}
+
+    limits: dict[str, Any] = {}
+    for name in ("RLIMIT_NOFILE", "RLIMIT_NPROC", "RLIMIT_AS", "RLIMIT_CPU", "RLIMIT_FSIZE"):
+        rlimit = getattr(resource, name, None)
+        if rlimit is None:
+            continue
+        try:
+            soft, hard = resource.getrlimit(rlimit)
+            limits[name] = {"soft": soft, "hard": hard}
+        except (ValueError, OSError) as exc:
+            limits[name] = {"error": repr(exc)}
+    result["rlimits"] = limits
+
+    for label, directory in (("tmp", "/tmp"), ("workspace", "/workspace")):
+        try:
+            with tempfile.NamedTemporaryFile(dir=directory) as tmp_file:
+                tmp_file.write(b"probe")
+                tmp_file.flush()
+            result[f"{label}_writable"] = True
+        except OSError as exc:
+            result[f"{label}_writable"] = False
+            result[f"{label}_write_error"] = repr(exc)
+
+    return result
+
+
+def network_info() -> dict[str, Any]:
+    """Bare TCP connect + DNS lookup only - no TLS handshake, no HTTP
+    request, no data sent - just enough to answer "can this function reach
+    the outside world at all", which gates most creative uses of it."""
+    result: dict[str, Any] = {}
+    try:
+        addresses = sorted({addr[4][0] for addr in socket.getaddrinfo("www.googleapis.com", 443)})
+        result["dns_resolution"] = {"host": "www.googleapis.com", "addresses": addresses}
+    except OSError as exc:
+        result["dns_resolution"] = {"error": repr(exc)}
+
+    try:
+        with socket.create_connection(("www.googleapis.com", 443), timeout=3):
+            result["outbound_tcp_443"] = True
+    except OSError as exc:
+        result["outbound_tcp_443"] = False
+        result["outbound_tcp_443_error"] = repr(exc)
+
+    return result
 
 
 def cnb_info() -> dict[str, Any]:
@@ -433,16 +574,31 @@ def introspect() -> dict[str, Any]:
                 "dpkg-query",
                 "apt",
                 "apt-cache",
+                "pid1",
+                "serve",
+                "gs",
+                "perl",
+                "openssl",
+                "gunicorn",
             )
         },
         "go": go_info(),
         "go_binary_scan": go_binary_scan(),
+        "entrypoint_binaries": entrypoint_binaries_info(),
+        "binary_survey": survey_binaries(
+            ("/usr/bin", "/usr/local/bin", "/usr/sbin", "/usr/local/sbin"),
+            max_entries=150,
+        ),
         "cnb": cnb_info(),
         "layers": layers_info(),
         "os_release": os_release_info(),
         "packages": package_info(),
         "filesystem": filesystem_info(),
         "process": process_info(),
+        "python_packages": installed_python_packages(),
+        "resources": resource_info(),
+        "network": network_info(),
+        "workspace": list_directory("/workspace"),
     }
 
 
