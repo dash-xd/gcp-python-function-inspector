@@ -7,9 +7,10 @@ relying on that being set externally, so this repo still builds, runs,
 and deploys standalone.
 """
 import os
+from os import path
 
 os.environ.setdefault("ROUTER_MODULE", "gcp_python_function_inspector.router")
 
 from cloud_function_app import CloudFunctionApp
 
-main = CloudFunctionApp().build()
+main = CloudFunctionApp(root=path.dirname(path.abspath(__file__))).build()
