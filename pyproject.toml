@@ -9,7 +9,7 @@ description = "Runtime/environment introspection routes for a GCP Cloud Function
 requires-python = ">=3.11"
 dependencies = [
     "flask",
-    "pyspace-minimal @ git+https://github.com/dash-xd/pyspace-minimal.git@main",
+    "pyspace-minimal @ git+https://github.com/dash-xd/pyspace-minimal.git@claude/flask-cloud-function-template-r9sbs9",
 ]
 
 [tool.setuptools.packages.find]

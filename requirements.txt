@@ -1,2 +1,5 @@
+# Pinned to the feature branch, not main - CloudFunctionApp doesn't
+# exist on pyspace-minimal's main yet. Repoint at main (or a tag) once
+# that branch merges.
 functions-framework==3.*
-git+https://github.com/dash-xd/pyspace-minimal.git@main
+git+https://github.com/dash-xd/pyspace-minimal.git@claude/flask-cloud-function-template-r9sbs9
